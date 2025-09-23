@@ -1,6 +1,6 @@
 -- Player Engine 
 -- Maintained by linkst & kill
--- Version: 0.0.1+beta 
+-- Version: 0.0.2+beta 
 
 local env = getgenv()
 
@@ -15,6 +15,10 @@ local WorkspaceService = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = PlayersService.LocalPlayer
 local CurrentCamera = WorkspaceService.CurrentCamera
+
+
+local RayParams = RaycastParams.new()
+RayParams.FilterType = Enum.RaycastFilterType.Exclude
 
 -- Engine Types 
 type maid_task = RBXScriptConnection | Instance | () -> () | { Destroy: (any) -> () }
@@ -239,18 +243,35 @@ function PlayerTrackerMetatable:Update(deltaTime: number)
 
 
     do
-        local cam = CurrentCamera
-        if cam and self.headPart then
-            local v2, on, depth = cam:WorldToViewportPoint(self.headPart.Position)
-            self.onScreen = (on == true)
-            self.screenPoint = Vector2.new(v2.X, v2.Y)
-            self.screenDepth = depth
-        else
-            self.onScreen = false
-            self.screenPoint = nil
-            self.screenDepth = nil
+
+    local cam = WorkspaceService.CurrentCamera
+    local head = self.headPart
+    if cam and head then
+        local v2, on, depth = cam:WorldToViewportPoint(head.Position)
+
+        local visible = false
+        if on then
+            local origin = cam.CFrame.Position
+            local direction = head.Position - origin
+
+            local ignore = table.create(2)
+            if self.characterModel then table.insert(ignore, self.characterModel) end
+            if LocalPlayer and LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
+            RayParams.FilterDescendantsInstances = ignore
+
+            local hit = workspace:Raycast(origin, direction, RayParams)
+            visible = (hit == nil)
         end
+
+        self.onScreen = (on == true) and visible
+        self.screenPoint = Vector2.new(v2.X, v2.Y)
+        self.screenDepth = depth
+    else
+        self.onScreen = false
+        self.screenPoint = nil
+        self.screenDepth = nil
     end
+end
 
     local writeIndex = (self._historyWriteIndex % self._historyCapacity) + 1
     self._positionHistory[writeIndex] = self.position
@@ -397,12 +418,14 @@ function PlayerEngineObject:ObserveTrackers(callback: (tracker: PlayerTracker, a
 end
 
 function PlayerEngineObject:WorldToScreen(pointWorld: vec3)
-    if not CurrentCamera then
+    local cam = WorkspaceService.CurrentCamera
+    if not cam then
         return Vector2.zero, false, 0
     end
-    local screenPoint, onScreen, depth = CurrentCamera:WorldToViewportPoint(pointWorld)
+    local screenPoint, onScreen, depth = cam:WorldToViewportPoint(pointWorld)
     return Vector2.new(screenPoint.X, screenPoint.Y), onScreen, depth
 end
+
 
 function PlayerEngineObject:GetHeadCFrame(player: Player): cfrm?
     local tracker = self:GetTrackerByPlayer(player) or self:GetOrCreateTracker(player)
