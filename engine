@@ -1,0 +1,433 @@
+-- Player Engine 
+-- Maintained by linkst & kill
+-- Version: 0.0.1+beta 
+
+local env = getgenv()
+
+if env.ALSPlayerEngine and typeof(env.ALSPlayerEngine.Destroy) == "function" then
+    pcall(function() env.ALSPlayerEngine:Destroy() end)
+end
+
+-- services 
+local PlayersService = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local WorkspaceService = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = PlayersService.LocalPlayer
+local CurrentCamera = WorkspaceService.CurrentCamera
+
+-- Engine Types 
+type maid_task = RBXScriptConnection | Instance | () -> () | { Destroy: (any) -> () }
+type Maid = { Give: (self: Maid, task: maid_task) -> maid_task, Clean: (self: Maid) -> () }
+type vec3 = Vector3
+type cfrm = CFrame
+
+type PlayerTracker = {
+    player: Player,
+    userId: number,
+
+    characterModel: Model?,
+    humanoid: Humanoid?,
+    rootPart: BasePart?,
+    headPart: BasePart?,
+
+    isAlive: boolean,
+    team: Team?,
+    teamColor: Color3?,
+
+    position: vec3,
+    velocity: vec3,
+    cframe: cfrm,
+
+    bboxCFrame: cfrm,
+    bboxSize: vec3,
+
+    _historyWriteIndex: number,
+    _historyCapacity: number,
+    _positionHistory: {vec3},
+    _velocityHistory: {vec3},
+    _cframeHistory: {cfrm},
+
+    _maid: Maid,
+    _characterAddedConnection: RBXScriptConnection?,
+    _diedConnection: RBXScriptConnection?,
+    _rootAncestryConnection: RBXScriptConnection?,
+
+    Update: (self: PlayerTracker, deltaTime: number) -> (),
+    RefreshCharacterLinks: (self: PlayerTracker) -> (),
+    GetHistory: (self: PlayerTracker, count: number) -> ({position: vec3, velocity: vec3, cframe: cfrm}),
+    GetBonePart: (self: PlayerTracker, name: string) -> BasePart?,
+    GetAllMotor6Ds: (self: PlayerTracker) -> {Motor6D},
+    GetBoneCFrame: (self: PlayerTracker, boneName: string) -> cfrm?,
+}
+
+
+type PlayerEngine = {
+    Options: {
+        SampleRateHz: number,
+        HistoryLength: number,
+        TrackNPCs: boolean,
+    },
+
+    GetLocalTracker: (self: PlayerEngine) -> PlayerTracker?,
+    GetTrackerByPlayer: (self: PlayerEngine, player: Player) -> PlayerTracker?,
+    GetTrackerByUserId: (self: PlayerEngine, userId: number) -> PlayerTracker?,
+    ForEachTracker: (self: PlayerEngine, callback: (tracker: PlayerTracker) -> ()) -> (),
+    ObserveTrackers: (self: PlayerEngine, callback: (tracker: PlayerTracker, added: boolean) -> ()) -> () -> (),
+    WorldToScreen: (self: PlayerEngine, pointWorld: vec3) -> (Vector2, boolean, number),
+    GetOrCreateTracker: (self: PlayerEngine, player: Player) -> PlayerTracker,
+    Destroy: (self: PlayerEngine) -> (),
+
+    GetHeadCFrame: (self: PlayerEngine, player: Player) -> cfrm?,
+    GetRootCFrame: (self: PlayerEngine, player: Player) -> cfrm?,
+    IsAlive: (self: PlayerEngine, player: Player) -> boolean,
+}
+
+
+
+
+local function NewMaid(): Maid
+    local self = { _tasks = {} } :: any
+
+    function self:Give(task: maid_task): maid_task
+        table.insert(self._tasks, task)
+        return task
+    end
+
+    function self:Clean()
+        for index = #self._tasks, 1, -1 do
+            local task = self._tasks[index]
+            local taskType = typeof(task)
+            if taskType == "RBXScriptConnection" then
+                pcall(function() (task :: RBXScriptConnection):Disconnect() end)
+            elseif taskType == "Instance" then
+                pcall(function() (task :: Instance):Destroy() end)
+            elseif type(task) == "function" then
+                pcall(task :: () -> ())
+            elseif type(task) == "table" and typeof((task :: any).Destroy) == "function" then
+                pcall(function() (task :: any):Destroy() end)
+            end
+        end
+        table.clear(self._tasks)
+    end
+
+    return self :: Maid
+end
+
+
+local PlayerTrackerMetatable = {} :: { __index: any }
+PlayerTrackerMetatable.__index = PlayerTrackerMetatable
+
+
+local function NewPlayerTracker(player: Player, historyCapacity: number): PlayerTracker
+    local maid = NewMaid()
+    local capacity = math.max(8, historyCapacity)
+
+    local tracker = setmetatable({
+        player = player,
+        userId = player.UserId,
+
+        characterModel = nil,
+        humanoid = nil,
+        rootPart = nil,
+        headPart = nil,
+
+        isAlive = false,
+        team = player.Team,
+        teamColor = player.Team and player.Team.TeamColor.Color or nil,
+
+        position = Vector3.zero,
+        velocity = Vector3.zero,
+        cframe = CFrame.new(),
+
+        bboxCFrame = CFrame.new(),
+        bboxSize   = Vector3.zero,
+
+        _historyWriteIndex = 0,
+        _historyCapacity = capacity,
+        _positionHistory = table.create(capacity),
+        _velocityHistory = table.create(capacity),
+        _cframeHistory  = table.create(capacity),
+
+        _maid = maid,
+        _characterAddedConnection = nil,
+        _diedConnection = nil,
+        _rootAncestryConnection = nil,
+    } :: any, PlayerTrackerMetatable) :: PlayerTracker
+
+    tracker._characterAddedConnection = maid:Give(player.CharacterAdded:Connect(function(character)
+        tracker.characterModel = character
+        tracker:RefreshCharacterLinks()
+    end))
+    maid:Give(player.CharacterRemoving:Connect(function()
+        tracker.isAlive = false
+        tracker.characterModel, tracker.humanoid, tracker.rootPart, tracker.headPart = nil, nil, nil, nil
+    end))
+
+    if player.Character then
+        tracker.characterModel = player.Character
+        tracker:RefreshCharacterLinks()
+    end
+
+    return tracker
+end
+
+
+function PlayerTrackerMetatable:RefreshCharacterLinks()
+    local character = self.characterModel
+    if not character then return end
+
+    self.humanoid = character:FindFirstChildOfClass("Humanoid") :: Humanoid?
+    self.rootPart = (character:FindFirstChild("HumanoidRootPart") or character:FindFirstChildWhichIsA("BasePart")) :: BasePart?
+    self.headPart = character:FindFirstChild("Head") :: BasePart?
+
+    self.isAlive = (self.humanoid ~= nil and self.rootPart ~= nil)
+
+    if self._diedConnection then
+        pcall(function() (self._diedConnection :: RBXScriptConnection):Disconnect() end)
+        self._diedConnection = nil
+    end
+    if self.humanoid then
+        self._diedConnection = self._maid:Give(self.humanoid.Died:Connect(function()
+            self.isAlive = false
+        end))
+    end
+
+    if self._rootAncestryConnection then
+        pcall(function() (self._rootAncestryConnection :: RBXScriptConnection):Disconnect() end)
+        self._rootAncestryConnection = nil
+    end
+    if self.rootPart then
+        self._rootAncestryConnection = self._maid:Give(self.rootPart.AncestryChanged:Connect(function(_, parent)
+            if parent == nil then
+                self.isAlive = false
+            end
+        end))
+    end
+end
+
+function PlayerTrackerMetatable:Update(deltaTime: number)
+    local rootPart = self.rootPart
+    if not rootPart then
+        self.isAlive = false
+        self.team = self.player.Team
+        self.teamColor = self.player.Team and self.player.Team.TeamColor.Color or nil
+        return
+    end
+
+    self.cframe   = rootPart.CFrame
+    self.position = rootPart.Position
+    self.velocity = rootPart.AssemblyLinearVelocity or Vector3.zero
+
+    local bboxCFrame: CFrame
+    local bboxSize: Vector3
+    if self.characterModel then
+        bboxCFrame, bboxSize = self.characterModel:GetBoundingBox()
+    else
+        bboxCFrame, bboxSize = rootPart.CFrame, rootPart.Size
+    end
+    self.bboxCFrame = bboxCFrame
+    self.bboxSize   = bboxSize
+
+    local writeIndex = (self._historyWriteIndex % self._historyCapacity) + 1
+    self._positionHistory[writeIndex] = self.position
+    self._velocityHistory[writeIndex] = self.velocity
+    self._cframeHistory[writeIndex]   = self.cframe
+    self._historyWriteIndex = writeIndex
+
+    self.isAlive = true
+
+    self.team = self.player.Team
+    self.teamColor = self.player.Team and self.player.Team.TeamColor.Color or nil
+end
+
+function PlayerTrackerMetatable:GetHistory(count: number)
+    count = math.clamp(count, 1, self._historyCapacity)
+    local result = {}
+    local start = self._historyWriteIndex
+    for i = 0, count - 1 do
+        local index = ((start - i - 1) % self._historyCapacity) + 1
+        result[#result + 1] = {
+            position = self._positionHistory[index],
+            velocity = self._velocityHistory[index],
+            cframe   = self._cframeHistory[index],
+        }
+    end
+    return result
+end
+
+function PlayerTrackerMetatable:GetAllMotor6Ds(): {Motor6D}
+    local result = {}
+    local character = self.characterModel
+    if not character then return result end
+    for _, descendant in ipairs(character:GetDescendants()) do
+        if descendant:IsA("Motor6D") then
+            table.insert(result, descendant)
+        end
+    end
+    return result
+end
+
+function PlayerTrackerMetatable:GetBonePart(name: string): BasePart?
+    local character = self.characterModel
+    if not character then return nil end
+    return character:FindFirstChild(name, true) :: BasePart?
+end
+
+function PlayerTrackerMetatable:GetBoneCFrame(boneName: string): cfrm?
+    local part = self:GetBonePart(boneName)
+    if part and part:IsA("BasePart") then
+        return (part :: BasePart).CFrame
+    end
+    return nil
+end
+
+
+
+
+local EngineMaid = NewMaid()
+local Observers  : { [string]: (PlayerTracker, boolean) -> () } = {}
+
+local function NewId()
+    return HttpService:GenerateGUID(false)
+end
+
+local PlayerEngineObject = {
+    Options = {
+        SampleRateHz = 60,
+        HistoryLength = 60,
+        TrackNPCs = false,
+    },
+
+    _trackersByUserId = {} :: { [number]: PlayerTracker },
+    _heartbeatConnection = nil :: RBXScriptConnection?,
+    _accumulatorSeconds = 0,
+    _fixedStepSeconds = 1 / 60,
+} :: any
+
+PlayerEngineObject.__index = PlayerEngineObject
+
+function PlayerEngineObject:_startHeartbeat()
+    if self._heartbeatConnection then return end
+    self._fixedStepSeconds = 1 / math.max(10, self.Options.SampleRateHz)
+    self._heartbeatConnection = EngineMaid:Give(RunService.Heartbeat:Connect(function(deltaTime: number)
+        self._accumulatorSeconds += deltaTime
+        while self._accumulatorSeconds >= self._fixedStepSeconds do
+            self._accumulatorSeconds -= self._fixedStepSeconds
+            for _, tracker in pairs(self._trackersByUserId) do
+                tracker:Update(self._fixedStepSeconds)
+            end
+        end
+    end))
+end
+
+function PlayerEngineObject:_stopHeartbeat()
+    if self._heartbeatConnection then
+        pcall(function() self._heartbeatConnection:Disconnect() end)
+        self._heartbeatConnection = nil
+    end
+end
+
+function PlayerEngineObject:GetOrCreateTracker(player: Player): PlayerTracker
+    local userId = player.UserId
+    local tracker = self._trackersByUserId[userId]
+    if tracker then return tracker end
+
+    tracker = NewPlayerTracker(player, self.Options.HistoryLength)
+    self._trackersByUserId[userId] = tracker
+
+    for _, callback in pairs(Observers) do
+        pcall(callback, tracker, true)
+    end
+    return tracker
+end
+
+function PlayerEngineObject:GetTrackerByPlayer(player: Player): PlayerTracker?
+    if not player then return nil end
+    return self._trackersByUserId[player.UserId]
+end
+
+function PlayerEngineObject:GetTrackerByUserId(userId: number): PlayerTracker?
+    return self._trackersByUserId[userId]
+end
+
+function PlayerEngineObject:GetLocalTracker(): PlayerTracker?
+    if not LocalPlayer then return nil end
+    return self:GetOrCreateTracker(LocalPlayer)
+end
+
+function PlayerEngineObject:ForEachTracker(callback: (tracker: PlayerTracker) -> ())
+    for _, tracker in pairs(self._trackersByUserId) do
+        callback(tracker)
+    end
+end
+
+function PlayerEngineObject:ObserveTrackers(callback: (tracker: PlayerTracker, added: boolean) -> ())
+    local token = NewId()
+    Observers[token] = callback
+    for _, tracker in pairs(self._trackersByUserId) do
+        pcall(callback, tracker, true)
+    end
+    return function()
+        Observers[token] = nil
+    end
+end
+
+function PlayerEngineObject:WorldToScreen(pointWorld: vec3)
+    if not CurrentCamera then
+        return Vector2.zero, false, 0
+    end
+    local screenPoint, onScreen, depth = CurrentCamera:WorldToViewportPoint(pointWorld)
+    return Vector2.new(screenPoint.X, screenPoint.Y), onScreen, depth
+end
+
+function PlayerEngineObject:GetHeadCFrame(player: Player): cfrm?
+    local tracker = self:GetTrackerByPlayer(player) or self:GetOrCreateTracker(player)
+    return tracker and (tracker.headPart and tracker.headPart.CFrame or nil)
+end
+
+function PlayerEngineObject:GetRootCFrame(player: Player): cfrm?
+    local tracker = self:GetTrackerByPlayer(player) or self:GetOrCreateTracker(player)
+    return tracker and (tracker.rootPart and tracker.rootPart.CFrame or nil)
+end
+
+function PlayerEngineObject:IsAlive(player: Player): boolean
+    local tracker = self:GetTrackerByPlayer(player) or self:GetOrCreateTracker(player)
+    return tracker and tracker.isAlive or false
+end
+
+function PlayerEngineObject:Destroy()
+    self:_stopHeartbeat()
+    for _, tracker in pairs(self._trackersByUserId) do
+        pcall(function() (tracker :: any)._maid:Clean() end)
+    end
+    table.clear(self._trackersByUserId)
+    for key in pairs(Observers) do Observers[key] = nil end
+end
+
+
+EngineMaid:Give(PlayersService.PlayerAdded:Connect(function(player: Player)
+    PlayerEngineObject:GetOrCreateTracker(player)
+end))
+
+EngineMaid:Give(PlayersService.PlayerRemoving:Connect(function(player: Player)
+    local userId = player.UserId
+    local tracker = PlayerEngineObject._trackersByUserId[userId]
+    if tracker then
+        for _, callback in pairs(Observers) do
+            pcall(callback, tracker, false)
+        end
+        pcall(function() (tracker :: any)._maid:Clean() end)
+        PlayerEngineObject._trackersByUserId[userId] = nil
+    end
+end))
+
+for _, player in ipairs(PlayersService:GetPlayers()) do
+    PlayerEngineObject:GetOrCreateTracker(player)
+end
+
+PlayerEngineObject:_startHeartbeat()
+
+env.AllServicesPlayerEngine = PlayerEngineObject
+
+
