@@ -4,8 +4,8 @@
 
 local env = getgenv()
 
-if env.ALSPlayerEngine and typeof(env.ALSPlayerEngine.Destroy) == "function" then
-    pcall(function() env.ALSPlayerEngine:Destroy() end)
+if env.AllServicesPlayerEngine and typeof(env.AllServicesPlayerEngine.Destroy) == "function" then
+    pcall(function() env.AllServicesPlayerEngine:Destroy() end)
 end
 
 -- services 
@@ -42,6 +42,10 @@ type PlayerTracker = {
     bboxCFrame: cfrm,
     bboxSize: vec3,
 
+    onScreen: boolean,
+    screenPoint: Vector2?,
+    screenDepth: number?,
+    
     _historyWriteIndex: number,
     _historyCapacity: number,
     _positionHistory: {vec3},
@@ -143,6 +147,10 @@ local function NewPlayerTracker(player: Player, historyCapacity: number): Player
         bboxCFrame = CFrame.new(),
         bboxSize   = Vector3.zero,
 
+        onScreen = false,
+        screenPoint = nil,
+        screenDepth = nil,
+
         _historyWriteIndex = 0,
         _historyCapacity = capacity,
         _positionHistory = table.create(capacity),
@@ -228,6 +236,21 @@ function PlayerTrackerMetatable:Update(deltaTime: number)
     end
     self.bboxCFrame = bboxCFrame
     self.bboxSize   = bboxSize
+
+
+    do
+        local cam = CurrentCamera
+        if cam and self.headPart then
+            local v2, on, depth = cam:WorldToViewportPoint(self.headPart.Position)
+            self.onScreen = (on == true)
+            self.screenPoint = Vector2.new(v2.X, v2.Y)
+            self.screenDepth = depth
+        else
+            self.onScreen = false
+            self.screenPoint = nil
+            self.screenDepth = nil
+        end
+    end
 
     local writeIndex = (self._historyWriteIndex % self._historyCapacity) + 1
     self._positionHistory[writeIndex] = self.position
@@ -403,6 +426,19 @@ function PlayerEngineObject:Destroy()
     end
     table.clear(self._trackersByUserId)
     for key in pairs(Observers) do Observers[key] = nil end
+end
+
+function PlayerEngineObject:IsOnScreen(player: Player): boolean
+    local tracker = self:GetTrackerByPlayer(player) or self:GetOrCreateTracker(player)
+    return tracker and tracker.onScreen or false
+end
+
+function PlayerEngineObject:GetScreenPoint(player: Player): (Vector2?, boolean, number?)
+    local tracker = self:GetTrackerByPlayer(player) or self:GetOrCreateTracker(player)
+    if tracker then
+        return tracker.screenPoint, tracker.onScreen, tracker.screenDepth
+    end
+    return nil, false, nil
 end
 
 
