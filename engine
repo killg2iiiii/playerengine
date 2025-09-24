@@ -1,14 +1,12 @@
 -- Player Engine 
 -- Maintained by linkst & kill
--- Version: 0.0.2+beta 
+-- Version: 0.0.3+beta 
 
 local env = getgenv()
-
 if env.AllServicesPlayerEngine and typeof(env.AllServicesPlayerEngine.Destroy) == "function" then
     pcall(function() env.AllServicesPlayerEngine:Destroy() end)
 end
 
--- services 
 local PlayersService = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local WorkspaceService = game:GetService("Workspace")
@@ -16,59 +14,84 @@ local HttpService = game:GetService("HttpService")
 local LocalPlayer = PlayersService.LocalPlayer
 local CurrentCamera = WorkspaceService.CurrentCamera
 
-
 local RayParams = RaycastParams.new()
 RayParams.FilterType = Enum.RaycastFilterType.Exclude
 
--- Engine Types 
 type maid_task = RBXScriptConnection | Instance | () -> () | { Destroy: (any) -> () }
 type Maid = { Give: (self: Maid, task: maid_task) -> maid_task, Clean: (self: Maid) -> () }
 type vec3 = Vector3
 type cfrm = CFrame
 
+type CachedData = {
+    screenBounds: {min: Vector2, max: Vector2}?,
+    screenBoundsFrame: number,
+    distanceToLocal: number?,
+    distanceToLocalFrame: number,
+    distanceToCamera: number?,
+    distanceToCameraFrame: number,
+    angleToLocal: number?,
+    angleToLocalFrame: number,
+    dotToCamera: number?,
+    dotToCameraFrame: number,
+    visibilityScore: number?,
+    visibilityFrame: number,
+    occlusionState: string?,
+    occlusionFrame: number,
+    speed: number?,
+    speedFrame: number,
+    acceleration: vec3?,
+    accelerationFrame: number,
+    isMoving: boolean,
+    movementDirection: vec3?,
+}
+
 type PlayerTracker = {
     player: Player,
     userId: number,
-
     characterModel: Model?,
     humanoid: Humanoid?,
     rootPart: BasePart?,
     headPart: BasePart?,
-
     isAlive: boolean,
     team: Team?,
     teamColor: Color3?,
-
     position: vec3,
     velocity: vec3,
     cframe: cfrm,
-
     bboxCFrame: cfrm,
     bboxSize: vec3,
-
     onScreen: boolean,
     screenPoint: Vector2?,
     screenDepth: number?,
-    
     _historyWriteIndex: number,
     _historyCapacity: number,
     _positionHistory: {vec3},
     _velocityHistory: {vec3},
     _cframeHistory: {cfrm},
-
     _maid: Maid,
     _characterAddedConnection: RBXScriptConnection?,
     _diedConnection: RBXScriptConnection?,
     _rootAncestryConnection: RBXScriptConnection?,
-
+    _cache: CachedData,
     Update: (self: PlayerTracker, deltaTime: number) -> (),
     RefreshCharacterLinks: (self: PlayerTracker) -> (),
     GetHistory: (self: PlayerTracker, count: number) -> ({position: vec3, velocity: vec3, cframe: cfrm}),
     GetBonePart: (self: PlayerTracker, name: string) -> BasePart?,
     GetAllMotor6Ds: (self: PlayerTracker) -> {Motor6D},
     GetBoneCFrame: (self: PlayerTracker, boneName: string) -> cfrm?,
+    GetDistanceToLocal: (self: PlayerTracker) -> number?,
+    GetSpeed: (self: PlayerTracker) -> number,
+    GetScreenBounds: (self: PlayerTracker) -> ({min: Vector2, max: Vector2})?,
+    GetPredictedPosition: (self: PlayerTracker, timeAhead: number) -> vec3,
+    GetInterpolatedPosition: (self: PlayerTracker, alpha: number) -> vec3,
+    GetVisibilityScore: (self: PlayerTracker) -> number,
+    GetAttachment: (self: PlayerTracker, name: string) -> Attachment?,
+    GetAttachmentWorldCFrame: (self: PlayerTracker, name: string) -> cfrm?,
+    GetBoneChain: (self: PlayerTracker, startBone: string, endBone: string) -> {BasePart}?,
+    GetLagCompensatedCFrame: (self: PlayerTracker, pingSeconds: number) -> cfrm,
+    IsLookingAt: (self: PlayerTracker, position: vec3, tolerance: number?) -> boolean,
+    GetRelativeVelocity: (self: PlayerTracker, relativeTo: PlayerTracker?) -> vec3,
 }
-
 
 type PlayerEngine = {
     Options: {
@@ -76,7 +99,6 @@ type PlayerEngine = {
         HistoryLength: number,
         TrackNPCs: boolean,
     },
-
     GetLocalTracker: (self: PlayerEngine) -> PlayerTracker?,
     GetTrackerByPlayer: (self: PlayerEngine, player: Player) -> PlayerTracker?,
     GetTrackerByUserId: (self: PlayerEngine, userId: number) -> PlayerTracker?,
@@ -85,23 +107,26 @@ type PlayerEngine = {
     WorldToScreen: (self: PlayerEngine, pointWorld: vec3) -> (Vector2, boolean, number),
     GetOrCreateTracker: (self: PlayerEngine, player: Player) -> PlayerTracker,
     Destroy: (self: PlayerEngine) -> (),
-
     GetHeadCFrame: (self: PlayerEngine, player: Player) -> cfrm?,
     GetRootCFrame: (self: PlayerEngine, player: Player) -> cfrm?,
     IsAlive: (self: PlayerEngine, player: Player) -> boolean,
+    IsOnScreen: (self: PlayerEngine, player: Player) -> boolean,
+    GetScreenPoint: (self: PlayerEngine, player: Player) -> (Vector2?, boolean, number?),
+    GetPlayersInRadius: (self: PlayerEngine, center: vec3, radius: number, excludeLocal: boolean?) -> {PlayerTracker},
+    GetPlayersOnScreen: (self: PlayerEngine, includePartial: boolean?) -> {PlayerTracker},
+    GetClosestPlayer: (self: PlayerEngine, toPosition: vec3, maxDistance: number?) -> PlayerTracker?,
+    GetTeammates: (self: PlayerEngine, player: Player?) -> {PlayerTracker},
+    GetEnemies: (self: PlayerEngine, player: Player?) -> {PlayerTracker},
+    GetMetrics: (self: PlayerEngine) -> {updateTime: number, trackerCount: number, aliveCount: number, onScreenCount: number, averageUpdateMs: number},
+    EnableSpatialIndexing: (self: PlayerEngine, cellSize: number?) -> (),
 }
-
-
-
 
 local function NewMaid(): Maid
     local self = { _tasks = {} } :: any
-
     function self:Give(task: maid_task): maid_task
         table.insert(self._tasks, task)
         return task
     end
-
     function self:Clean()
         for index = #self._tasks, 1, -1 do
             local task = self._tasks[index]
@@ -118,53 +143,77 @@ local function NewMaid(): Maid
         end
         table.clear(self._tasks)
     end
-
     return self :: Maid
 end
-
 
 local PlayerTrackerMetatable = {} :: { __index: any }
 PlayerTrackerMetatable.__index = PlayerTrackerMetatable
 
+local PlayerEngineObject = {
+    Options = { SampleRateHz = 60, HistoryLength = 60, TrackNPCs = false },
+    _trackersByUserId = {} :: { [number]: PlayerTracker },
+    _heartbeatConnection = nil :: RBXScriptConnection?,
+    _accumulatorSeconds = 0,
+    _fixedStepSeconds = 1 / 60,
+    _frameCounter = 0,
+    _lastUpdateTime = 0,
+    _avgUpdateMs = 0,
+    _spatialGrid = nil :: any,
+}
+PlayerEngineObject.__index = PlayerEngineObject
 
 local function NewPlayerTracker(player: Player, historyCapacity: number): PlayerTracker
     local maid = NewMaid()
     local capacity = math.max(8, historyCapacity)
-
     local tracker = setmetatable({
         player = player,
         userId = player.UserId,
-
         characterModel = nil,
         humanoid = nil,
         rootPart = nil,
         headPart = nil,
-
         isAlive = false,
         team = player.Team,
         teamColor = player.Team and player.Team.TeamColor.Color or nil,
-
         position = Vector3.zero,
         velocity = Vector3.zero,
         cframe = CFrame.new(),
-
         bboxCFrame = CFrame.new(),
         bboxSize   = Vector3.zero,
-
         onScreen = false,
         screenPoint = nil,
         screenDepth = nil,
-
         _historyWriteIndex = 0,
         _historyCapacity = capacity,
         _positionHistory = table.create(capacity),
         _velocityHistory = table.create(capacity),
         _cframeHistory  = table.create(capacity),
-
         _maid = maid,
         _characterAddedConnection = nil,
         _diedConnection = nil,
         _rootAncestryConnection = nil,
+        _cache = {
+            screenBounds = nil,
+            screenBoundsFrame = -1,
+            distanceToLocal = nil,
+            distanceToLocalFrame = -1,
+            distanceToCamera = nil,
+            distanceToCameraFrame = -1,
+            angleToLocal = nil,
+            angleToLocalFrame = -1,
+            dotToCamera = nil,
+            dotToCameraFrame = -1,
+            visibilityScore = 0,
+            visibilityFrame = -1,
+            occlusionState = nil,
+            occlusionFrame = -1,
+            speed = nil,
+            speedFrame = -1,
+            acceleration = nil,
+            accelerationFrame = -1,
+            isMoving = false,
+            movementDirection = nil,
+        } :: CachedData,
     } :: any, PlayerTrackerMetatable) :: PlayerTracker
 
     tracker._characterAddedConnection = maid:Give(player.CharacterAdded:Connect(function(character)
@@ -175,26 +224,20 @@ local function NewPlayerTracker(player: Player, historyCapacity: number): Player
         tracker.isAlive = false
         tracker.characterModel, tracker.humanoid, tracker.rootPart, tracker.headPart = nil, nil, nil, nil
     end))
-
     if player.Character then
         tracker.characterModel = player.Character
         tracker:RefreshCharacterLinks()
     end
-
     return tracker
 end
-
 
 function PlayerTrackerMetatable:RefreshCharacterLinks()
     local character = self.characterModel
     if not character then return end
-
     self.humanoid = character:FindFirstChildOfClass("Humanoid") :: Humanoid?
     self.rootPart = (character:FindFirstChild("HumanoidRootPart") or character:FindFirstChildWhichIsA("BasePart")) :: BasePart?
     self.headPart = character:FindFirstChild("Head") :: BasePart?
-
     self.isAlive = (self.humanoid ~= nil and self.rootPart ~= nil)
-
     if self._diedConnection then
         pcall(function() (self._diedConnection :: RBXScriptConnection):Disconnect() end)
         self._diedConnection = nil
@@ -204,7 +247,6 @@ function PlayerTrackerMetatable:RefreshCharacterLinks()
             self.isAlive = false
         end))
     end
-
     if self._rootAncestryConnection then
         pcall(function() (self._rootAncestryConnection :: RBXScriptConnection):Disconnect() end)
         self._rootAncestryConnection = nil
@@ -227,6 +269,7 @@ function PlayerTrackerMetatable:Update(deltaTime: number)
         return
     end
 
+    local prevVel = self.velocity
     self.cframe   = rootPart.CFrame
     self.position = rootPart.Position
     self.velocity = rootPart.AssemblyLinearVelocity or Vector3.zero
@@ -241,37 +284,31 @@ function PlayerTrackerMetatable:Update(deltaTime: number)
     self.bboxCFrame = bboxCFrame
     self.bboxSize   = bboxSize
 
-
     do
-
-    local cam = WorkspaceService.CurrentCamera
-    local head = self.headPart
-    if cam and head then
-        local v2, on, depth = cam:WorldToViewportPoint(head.Position)
-
-        local visible = false
-        if on then
-            local origin = cam.CFrame.Position
-            local direction = head.Position - origin
-
-            local ignore = table.create(2)
-            if self.characterModel then table.insert(ignore, self.characterModel) end
-            if LocalPlayer and LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
-            RayParams.FilterDescendantsInstances = ignore
-
-            local hit = workspace:Raycast(origin, direction, RayParams)
-            visible = (hit == nil)
+        local cam = CurrentCamera
+        local head = self.headPart
+        if cam and head then
+            local v2, on, depth = cam:WorldToViewportPoint(head.Position)
+            local visible = false
+            if on then
+                local origin = cam.CFrame.Position
+                local direction = head.Position - origin
+                local ignore = table.create(2)
+                if self.characterModel then table.insert(ignore, self.characterModel) end
+                if LocalPlayer and LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
+                RayParams.FilterDescendantsInstances = ignore
+                local hit = workspace:Raycast(origin, direction, RayParams)
+                visible = (hit == nil)
+            end
+            self.onScreen = (on == true) and visible
+            self.screenPoint = Vector2.new(v2.X, v2.Y)
+            self.screenDepth = depth
+        else
+            self.onScreen = false
+            self.screenPoint = nil
+            self.screenDepth = nil
         end
-
-        self.onScreen = (on == true) and visible
-        self.screenPoint = Vector2.new(v2.X, v2.Y)
-        self.screenDepth = depth
-    else
-        self.onScreen = false
-        self.screenPoint = nil
-        self.screenDepth = nil
     end
-end
 
     local writeIndex = (self._historyWriteIndex % self._historyCapacity) + 1
     self._positionHistory[writeIndex] = self.position
@@ -280,9 +317,20 @@ end
     self._historyWriteIndex = writeIndex
 
     self.isAlive = true
-
     self.team = self.player.Team
     self.teamColor = self.player.Team and self.player.Team.TeamColor.Color or nil
+
+    local frame = PlayerEngineObject._frameCounter
+    if self._cache.speedFrame ~= frame then
+        self._cache.speed = self.velocity.Magnitude
+        self._cache.speedFrame = frame
+    end
+    if self._cache.accelerationFrame ~= frame then
+        self._cache.acceleration = (self.velocity - prevVel) / math.max(1e-3, deltaTime)
+        self._cache.isMoving = (self._cache.speed or 0) > 0.05
+        self._cache.movementDirection = self._cache.isMoving and self.velocity.Unit or nil
+        self._cache.accelerationFrame = frame
+    end
 end
 
 function PlayerTrackerMetatable:GetHistory(count: number)
@@ -326,43 +374,195 @@ function PlayerTrackerMetatable:GetBoneCFrame(boneName: string): cfrm?
     return nil
 end
 
-
-
-
-local EngineMaid = NewMaid()
-local Observers  : { [string]: (PlayerTracker, boolean) -> () } = {}
-
-local function NewId()
-    return HttpService:GenerateGUID(false)
+function PlayerTrackerMetatable:GetDistanceToLocal(): number?
+    local frame = PlayerEngineObject._frameCounter
+    if self._cache.distanceToLocalFrame ~= frame then
+        local localTracker = PlayerEngineObject:GetLocalTracker()
+        if localTracker and localTracker.position then
+            self._cache.distanceToLocal = (self.position - localTracker.position).Magnitude
+            self._cache.distanceToLocalFrame = frame
+        end
+    end
+    return self._cache.distanceToLocal
 end
 
-local PlayerEngineObject = {
-    Options = {
-        SampleRateHz = 60,
-        HistoryLength = 60,
-        TrackNPCs = false,
-    },
+function PlayerTrackerMetatable:GetSpeed(): number
+    local frame = PlayerEngineObject._frameCounter
+    if self._cache.speedFrame ~= frame then
+        self._cache.speed = self.velocity.Magnitude
+        self._cache.speedFrame = frame
+    end
+    return self._cache.speed or 0
+end
 
-    _trackersByUserId = {} :: { [number]: PlayerTracker },
-    _heartbeatConnection = nil :: RBXScriptConnection?,
-    _accumulatorSeconds = 0,
-    _fixedStepSeconds = 1 / 60,
-} :: any
+function PlayerTrackerMetatable:GetScreenBounds(): {min: Vector2, max: Vector2}?
+    local frame = PlayerEngineObject._frameCounter
+    if self._cache.screenBoundsFrame ~= frame and self.onScreen then
+        local cam = CurrentCamera
+        if cam and self.characterModel then
+            local points = {}
+            local cf, size = self.bboxCFrame, self.bboxSize
+            for x = -1, 1, 2 do
+                for y = -1, 1, 2 do
+                    for z = -1, 1, 2 do
+                        local p = cf:PointToWorldSpace(Vector3.new(x*size.X/2, y*size.Y/2, z*size.Z/2))
+                        local s = cam:WorldToViewportPoint(p)
+                        points[#points+1] = Vector2.new(s.X, s.Y)
+                    end
+                end
+            end
+            local minX, minY = math.huge, math.huge
+            local maxX, maxY = -math.huge, -math.huge
+            for _, p in ipairs(points) do
+                if p.X < minX then minX = p.X end
+                if p.Y < minY then minY = p.Y end
+                if p.X > maxX then maxX = p.X end
+                if p.Y > maxY then maxY = p.Y end
+            end
+            self._cache.screenBounds = {min = Vector2.new(minX, minY), max = Vector2.new(maxX, maxY)}
+            self._cache.screenBoundsFrame = frame
+        end
+    end
+    return self._cache.screenBounds
+end
 
-PlayerEngineObject.__index = PlayerEngineObject
+function PlayerTrackerMetatable:GetPredictedPosition(timeAhead: number): vec3
+    if self._historyWriteIndex < 2 then
+        return self.position + (self.velocity * timeAhead)
+    end
+    local idx1 = self._historyWriteIndex
+    local idx2 = ((self._historyWriteIndex - 2) % self._historyCapacity) + 1
+    local vel1 = self._velocityHistory[idx1] or self.velocity
+    local vel2 = self._velocityHistory[idx2] or self.velocity
+    local accel = (vel1 - vel2) / math.max(1e-6, PlayerEngineObject._fixedStepSeconds)
+    return self.position + (self.velocity * timeAhead) + (accel * 0.5 * timeAhead * timeAhead)
+end
+
+function PlayerTrackerMetatable:GetInterpolatedPosition(alpha: number): vec3
+    local lastIdx = ((self._historyWriteIndex - 2) % self._historyCapacity) + 1
+    local lastPos = self._positionHistory[lastIdx]
+    if lastPos then
+        return lastPos:Lerp(self.position, math.clamp(alpha, 0, 1))
+    end
+    return self.position
+end
+
+function PlayerTrackerMetatable:GetVisibilityScore(): number
+    local frame = PlayerEngineObject._frameCounter
+    if self._cache.visibilityFrame ~= frame then
+        local score = 0
+        if self.onScreen then
+            score = 1
+            local dist = self:GetDistanceToLocal()
+            if dist then
+                score = score * math.clamp(1 - (dist / 500), 0, 1)
+            end
+            if self.screenPoint and CurrentCamera then
+                local center = CurrentCamera.ViewportSize / 2
+                local offset = (self.screenPoint - center).Magnitude
+                local maxOffset = center.Magnitude
+                score = score * math.clamp(1 - (offset / maxOffset), 0.5, 1)
+            end
+        end
+        self._cache.visibilityScore = score
+        self._cache.visibilityFrame = frame
+    end
+    return self._cache.visibilityScore or 0
+end
+
+function PlayerTrackerMetatable:GetAttachment(name: string): Attachment?
+    if not self.characterModel then return nil end
+    return self.characterModel:FindFirstChild(name, true) :: Attachment?
+end
+
+function PlayerTrackerMetatable:GetAttachmentWorldCFrame(name: string): cfrm?
+    local attachment = self:GetAttachment(name)
+    if attachment then
+        return attachment.WorldCFrame
+    end
+    return nil
+end
+
+function PlayerTrackerMetatable:GetBoneChain(startBone: string, endBone: string): {BasePart}?
+    local start = self:GetBonePart(startBone)
+    local finish = self:GetBonePart(endBone)
+    if not start or not finish then return nil end
+    local chain = {}
+    local current: Instance? = start
+    while current and current ~= finish do
+        table.insert(chain, current)
+        local found = false
+        for _, motor in ipairs((current :: Instance):GetChildren()) do
+            if motor:IsA("Motor6D") and motor.Part1 then
+                current = motor.Part1
+                found = true
+                break
+            end
+        end
+        if not found then break end
+    end
+    if current == finish then
+        table.insert(chain, finish)
+        return chain :: {BasePart}
+    end
+    return nil
+end
+
+function PlayerTrackerMetatable:GetLagCompensatedCFrame(pingSeconds: number): cfrm
+    local framesBack = math.ceil(pingSeconds / math.max(1e-6, PlayerEngineObject._fixedStepSeconds))
+    local idx = ((self._historyWriteIndex - framesBack - 1) % self._historyCapacity) + 1
+    return self._cframeHistory[idx] or self.cframe
+end
+
+function PlayerTrackerMetatable:IsLookingAt(position: vec3, tolerance: number?): boolean
+    tolerance = tolerance or 0.9
+    if not self.headPart then return false end
+    local lookDir = self.headPart.CFrame.LookVector
+    local toTarget = (position - self.headPart.Position).Unit
+    return lookDir:Dot(toTarget) > tolerance
+end
+
+function PlayerTrackerMetatable:GetRelativeVelocity(relativeTo: PlayerTracker?): vec3
+    if not relativeTo then
+        return self.velocity
+    end
+    return self.velocity - relativeTo.velocity
+end
 
 function PlayerEngineObject:_startHeartbeat()
     if self._heartbeatConnection then return end
     self._fixedStepSeconds = 1 / math.max(10, self.Options.SampleRateHz)
-    self._heartbeatConnection = EngineMaid:Give(RunService.Heartbeat:Connect(function(deltaTime: number)
+    self._heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime: number)
+        local t0 = os.clock()
         self._accumulatorSeconds += deltaTime
         while self._accumulatorSeconds >= self._fixedStepSeconds do
             self._accumulatorSeconds -= self._fixedStepSeconds
+            self._frameCounter += 1
+            if self._spatialGrid then
+                self._spatialGrid.grid = {}
+            end
             for _, tracker in pairs(self._trackersByUserId) do
                 tracker:Update(self._fixedStepSeconds)
+                if self._spatialGrid and tracker.isAlive then
+                    local cs = self._spatialGrid.cellSize
+                    local p = tracker.position
+                    local cx = math.floor(p.X / cs)
+                    local cy = math.floor(p.Y / cs)
+                    local cz = math.floor(p.Z / cs)
+                    local key = string.format("%d,%d,%d", cx, cy, cz)
+                    local bucket = self._spatialGrid.grid[key]
+                    if not bucket then
+                        bucket = {}
+                        self._spatialGrid.grid[key] = bucket
+                    end
+                    bucket[#bucket+1] = tracker
+                end
             end
         end
-    end))
+        local dtMs = (os.clock() - t0) * 1000
+        self._lastUpdateTime = dtMs
+        self._avgUpdateMs = self._avgUpdateMs == 0 and dtMs or (self._avgUpdateMs * 0.9 + dtMs * 0.1)
+    end)
 end
 
 function PlayerEngineObject:_stopHeartbeat()
@@ -376,11 +576,9 @@ function PlayerEngineObject:GetOrCreateTracker(player: Player): PlayerTracker
     local userId = player.UserId
     local tracker = self._trackersByUserId[userId]
     if tracker then return tracker end
-
     tracker = NewPlayerTracker(player, self.Options.HistoryLength)
     self._trackersByUserId[userId] = tracker
-
-    for _, callback in pairs(Observers) do
+    for _, callback in pairs((self :: any)._observers or {}) do
         pcall(callback, tracker, true)
     end
     return tracker
@@ -407,13 +605,14 @@ function PlayerEngineObject:ForEachTracker(callback: (tracker: PlayerTracker) ->
 end
 
 function PlayerEngineObject:ObserveTrackers(callback: (tracker: PlayerTracker, added: boolean) -> ())
-    local token = NewId()
-    Observers[token] = callback
+    if not (self :: any)._observers then (self :: any)._observers = {} end
+    local token = HttpService:GenerateGUID(false)
+    (self :: any)._observers[token] = callback
     for _, tracker in pairs(self._trackersByUserId) do
         pcall(callback, tracker, true)
     end
     return function()
-        Observers[token] = nil
+        (self :: any)._observers[token] = nil
     end
 end
 
@@ -425,7 +624,6 @@ function PlayerEngineObject:WorldToScreen(pointWorld: vec3)
     local screenPoint, onScreen, depth = cam:WorldToViewportPoint(pointWorld)
     return Vector2.new(screenPoint.X, screenPoint.Y), onScreen, depth
 end
-
 
 function PlayerEngineObject:GetHeadCFrame(player: Player): cfrm?
     local tracker = self:GetTrackerByPlayer(player) or self:GetOrCreateTracker(player)
@@ -442,15 +640,6 @@ function PlayerEngineObject:IsAlive(player: Player): boolean
     return tracker and tracker.isAlive or false
 end
 
-function PlayerEngineObject:Destroy()
-    self:_stopHeartbeat()
-    for _, tracker in pairs(self._trackersByUserId) do
-        pcall(function() (tracker :: any)._maid:Clean() end)
-    end
-    table.clear(self._trackersByUserId)
-    for key in pairs(Observers) do Observers[key] = nil end
-end
-
 function PlayerEngineObject:IsOnScreen(player: Player): boolean
     local tracker = self:GetTrackerByPlayer(player) or self:GetOrCreateTracker(player)
     return tracker and tracker.onScreen or false
@@ -464,6 +653,156 @@ function PlayerEngineObject:GetScreenPoint(player: Player): (Vector2?, boolean, 
     return nil, false, nil
 end
 
+function PlayerEngineObject:GetPlayersInRadius(center: vec3, radius: number, excludeLocal: boolean?): {PlayerTracker}
+    local results = {}
+    local r = radius
+    local r2 = r * r
+    if self._spatialGrid then
+        local cs = self._spatialGrid.cellSize
+        local cx = math.floor(center.X / cs)
+        local cy = math.floor(center.Y / cs)
+        local cz = math.floor(center.Z / cs)
+        for dx = -1, 1 do
+            for dy = -1, 1 do
+                for dz = -1, 1 do
+                    local key = string.format("%d,%d,%d", cx+dx, cy+dy, cz+dz)
+                    local bucket = self._spatialGrid.grid[key]
+                    if bucket then
+                        for _, tracker in ipairs(bucket) do
+                            if tracker.isAlive then
+                                if not (excludeLocal and tracker.player == LocalPlayer) then
+                                    local d2 = (tracker.position - center)
+                                    d2 = Vector3.new(d2.X*d2.X, d2.Y*d2.Y, d2.Z*d2.Z)
+                                    local sum = d2.X + d2.Y + d2.Z
+                                    if sum <= r2 then
+                                        results[#results+1] = tracker
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return results
+    end
+    for _, tracker in pairs(self._trackersByUserId) do
+        if tracker.isAlive then
+            if not (excludeLocal and tracker.player == LocalPlayer) then
+                local d = tracker.position - center
+                local sum = d.X*d.X + d.Y*d.Y + d.Z*d.Z
+                if sum <= r2 then
+                    results[#results+1] = tracker
+                end
+            end
+        end
+    end
+    return results
+end
+
+function PlayerEngineObject:GetPlayersOnScreen(includePartial: boolean?): {PlayerTracker}
+    local results = {}
+    local cam = CurrentCamera
+    if not cam then return results end
+    for _, tracker in pairs(self._trackersByUserId) do
+        if tracker.isAlive then
+            if tracker.onScreen then
+                results[#results+1] = tracker
+            elseif includePartial then
+                local bounds = tracker:GetScreenBounds()
+                if bounds then
+                    local vpSize = cam.ViewportSize
+                    if bounds.max.X > 0 and bounds.min.X < vpSize.X and bounds.max.Y > 0 and bounds.min.Y < vpSize.Y then
+                        results[#results+1] = tracker
+                    end
+                end
+            end
+        end
+    end
+    return results
+end
+
+function PlayerEngineObject:GetClosestPlayer(toPosition: vec3, maxDistance: number?): PlayerTracker?
+    local closest = nil
+    local closestDist = maxDistance or math.huge
+    for _, tracker in pairs(self._trackersByUserId) do
+        if tracker.isAlive and tracker.player ~= LocalPlayer then
+            local dist = (tracker.position - toPosition).Magnitude
+            if dist < closestDist then
+                closest = tracker
+                closestDist = dist
+            end
+        end
+    end
+    return closest
+end
+
+function PlayerEngineObject:GetTeammates(player: Player?): {PlayerTracker}
+    player = player or LocalPlayer
+    if not player or not player.Team then return {} end
+    local results = {}
+    for _, tracker in pairs(self._trackersByUserId) do
+        if tracker.player ~= player and tracker.team == player.Team then
+            results[#results+1] = tracker
+        end
+    end
+    return results
+end
+
+function PlayerEngineObject:GetEnemies(player: Player?): {PlayerTracker}
+    player = player or LocalPlayer
+    if not player then return {} end
+    local results = {}
+    local myTeam = player.Team
+    for _, tracker in pairs(self._trackersByUserId) do
+        if tracker.player ~= player then
+            if not myTeam or tracker.team ~= myTeam then
+                results[#results+1] = tracker
+            end
+        end
+    end
+    return results
+end
+
+function PlayerEngineObject:GetMetrics()
+    local aliveCount = 0
+    local onScreenCount = 0
+    local total = 0
+    for _, tracker in pairs(self._trackersByUserId) do
+        total += 1
+        if tracker.isAlive then
+            aliveCount += 1
+            if tracker.onScreen then
+                onScreenCount += 1
+            end
+        end
+    end
+    return {
+        updateTime = self._lastUpdateTime or 0,
+        trackerCount = total,
+        aliveCount = aliveCount,
+        onScreenCount = onScreenCount,
+        averageUpdateMs = self._avgUpdateMs or 0,
+    }
+end
+
+function PlayerEngineObject:EnableSpatialIndexing(cellSize: number?)
+    self._spatialGrid = { cellSize = cellSize or 50, grid = {} }
+end
+
+function PlayerEngineObject:Destroy()
+    self:_stopHeartbeat()
+    for _, tracker in pairs(self._trackersByUserId) do
+        pcall(function() (tracker :: any)._maid:Clean() end)
+    end
+    table.clear(self._trackersByUserId)
+    if (self :: any)._observers then
+        for key in pairs((self :: any)._observers) do (self :: any)._observers[key] = nil end
+    end
+    self._spatialGrid = nil
+end
+
+local EngineMaid = NewMaid()
 
 EngineMaid:Give(PlayersService.PlayerAdded:Connect(function(player: Player)
     PlayerEngineObject:GetOrCreateTracker(player)
@@ -473,8 +812,10 @@ EngineMaid:Give(PlayersService.PlayerRemoving:Connect(function(player: Player)
     local userId = player.UserId
     local tracker = PlayerEngineObject._trackersByUserId[userId]
     if tracker then
-        for _, callback in pairs(Observers) do
-            pcall(callback, tracker, false)
+        if (PlayerEngineObject :: any)._observers then
+            for _, callback in pairs((PlayerEngineObject :: any)._observers) do
+                pcall(callback, tracker, false)
+            end
         end
         pcall(function() (tracker :: any)._maid:Clean() end)
         PlayerEngineObject._trackersByUserId[userId] = nil
@@ -486,7 +827,4 @@ for _, player in ipairs(PlayersService:GetPlayers()) do
 end
 
 PlayerEngineObject:_startHeartbeat()
-
 env.AllServicesPlayerEngine = PlayerEngineObject
-
-
