@@ -1,6 +1,6 @@
 -- Player Engine 
 -- Maintained by linkst & kill
--- Version: 0.0.3+beta 
+-- Version: 0.0.4+beta 
 
 local env = getgenv()
 if env.AllServicesPlayerEngine and typeof(env.AllServicesPlayerEngine.Destroy) == "function" then
@@ -484,29 +484,32 @@ function PlayerTrackerMetatable:GetAttachmentWorldCFrame(name: string): cfrm?
 end
 
 function PlayerTrackerMetatable:GetBoneChain(startBone: string, endBone: string): {BasePart}?
-    local start = self:GetBonePart(startBone)
-    local finish = self:GetBonePart(endBone)
-    if not start or not finish then return nil end
-    local chain = {}
-    local current: Instance? = start
-    while current and current ~= finish do
+    local startPart = self:GetBonePart(startBone)
+    local endPart   = self:GetBonePart(endBone)
+    if not startPart or not endPart then return nil end
+
+    local chain: {BasePart} = {}
+    local current: BasePart? = startPart
+
+    while current and current ~= endPart do
         table.insert(chain, current)
-        local found = false
-        for _, motor in ipairs((current :: Instance):GetChildren()) do
-            if motor:IsA("Motor6D") and motor.Part1 then
-                current = motor.Part1
-                found = true
+        local nextPart: BasePart? = nil
+        for _, child in ipairs(current:GetChildren()) do
+            if child:IsA("Motor6D") and child.Part1 then
+                nextPart = child.Part1 
                 break
             end
         end
-        if not found then break end
+        current = nextPart
     end
-    if current == finish then
-        table.insert(chain, finish)
-        return chain :: {BasePart}
+
+    if current == endPart then
+        table.insert(chain, endPart)
+        return chain
     end
     return nil
 end
+
 
 function PlayerTrackerMetatable:GetLagCompensatedCFrame(pingSeconds: number): cfrm
     local framesBack = math.ceil(pingSeconds / math.max(1e-6, PlayerEngineObject._fixedStepSeconds))
@@ -523,10 +526,10 @@ function PlayerTrackerMetatable:IsLookingAt(position: vec3, tolerance: number?):
 end
 
 function PlayerTrackerMetatable:GetRelativeVelocity(relativeTo: PlayerTracker?): vec3
-    if not relativeTo then
-        return self.velocity
+    if relativeTo ~= nil then
+        return self.velocity - relativeTo.velocity
     end
-    return self.velocity - relativeTo.velocity
+    return self.velocity
 end
 
 function PlayerEngineObject:_startHeartbeat()
@@ -604,17 +607,27 @@ function PlayerEngineObject:ForEachTracker(callback: (tracker: PlayerTracker) ->
     end
 end
 
-function PlayerEngineObject:ObserveTrackers(callback: (tracker: PlayerTracker, added: boolean) -> ())
-    if not (self :: any)._observers then (self :: any)._observers = {} end
+function PlayerEngineObject:ObserveTrackers(callback: (tracker: PlayerTracker, added: boolean) -> ()): () -> ()
+    local selfAny: any = self
+    if selfAny._observers == nil then
+        selfAny._observers = {} :: {[string]: (PlayerTracker, boolean) -> ()}
+    end
+
+    local observers = selfAny._observers :: {[string]: (PlayerTracker, boolean) -> ()}
     local token = HttpService:GenerateGUID(false)
-    (self :: any)._observers[token] = callback
+
+    observers[token] = callback
+
     for _, tracker in pairs(self._trackersByUserId) do
         pcall(callback, tracker, true)
     end
+
     return function()
-        (self :: any)._observers[token] = nil
+        observers[token] = nil
     end
 end
+
+
 
 function PlayerEngineObject:WorldToScreen(pointWorld: vec3)
     local cam = WorkspaceService.CurrentCamera
@@ -737,32 +750,35 @@ function PlayerEngineObject:GetClosestPlayer(toPosition: vec3, maxDistance: numb
     return closest
 end
 
-function PlayerEngineObject:GetTeammates(player: Player?): {PlayerTracker}
-    player = player or LocalPlayer
-    if not player or not player.Team then return {} end
-    local results = {}
-    for _, tracker in pairs(self._trackersByUserId) do
-        if tracker.player ~= player and tracker.team == player.Team then
-            results[#results+1] = tracker
-        end
-    end
-    return results
-end
-
 function PlayerEngineObject:GetEnemies(player: Player?): {PlayerTracker}
-    player = player or LocalPlayer
-    if not player then return {} end
+    local p = player or LocalPlayer
+    if p == nil then return {} end
+
     local results = {}
-    local myTeam = player.Team
+    local myTeam = p.Team
     for _, tracker in pairs(self._trackersByUserId) do
-        if tracker.player ~= player then
-            if not myTeam or tracker.team ~= myTeam then
+        if tracker.player ~= p then
+            if myTeam == nil or tracker.team ~= myTeam then
                 results[#results+1] = tracker
             end
         end
     end
     return results
 end
+
+function PlayerEngineObject:GetTeammates(player: Player?): {PlayerTracker}
+    local p = player or LocalPlayer
+    if p == nil or p.Team == nil then return {} end
+
+    local results = {}
+    for _, tracker in pairs(self._trackersByUserId) do
+        if tracker.player ~= p and tracker.team == p.Team then
+            results[#results+1] = tracker
+        end
+    end
+    return results
+end
+
 
 function PlayerEngineObject:GetMetrics()
     local aliveCount = 0
